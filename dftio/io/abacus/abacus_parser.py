@@ -31,8 +31,26 @@ class AbacusParser(Parser):
             ):
         super(AbacusParser, self).__init__(root, prefix)
         mode = self.get_mode(idx=0)
-        if mode in ['nscf', "scf"]:
-            self.raw_sys = [dpdata.System(read(os.path.join(self._get_output_dir(idx), "STRU.cif")), fmt="ase/structure") for idx in range(len(self.raw_datas))]
+        if mode in ['nscf', "scf", "get_S"]:
+            # scf/nscf/get_S are single-point structure calculations. scf/nscf output
+            # STRU.cif in the OUT dir, while get_S normally does not; in that case fall
+            # back to the input STRU file in the task directory.
+            self.raw_sys = []
+            for idx in range(len(self.raw_datas)):
+                stru_cif = os.path.join(self._get_output_dir(idx), "STRU.cif")
+                if os.path.exists(stru_cif):
+                    self.raw_sys.append(dpdata.System(read(stru_cif), fmt="ase/structure"))
+                elif mode == "get_S":
+                    stru_file = os.path.join(self.raw_datas[idx], "STRU")
+                    assert os.path.exists(stru_file), (
+                        f"Cannot find structure for task {self.raw_datas[idx]}: neither "
+                        f"{stru_cif} nor {stru_file} exists."
+                    )
+                    self.raw_sys.append(dpdata.System(stru_file, fmt="abacus/stru"))
+                else:
+                    raise FileNotFoundError(
+                        f"Cannot find structure file {stru_cif} for task {self.raw_datas[idx]}."
+                    )
         else:
             self.raw_sys = [dpdata.LabeledSystem(self.raw_datas[idx], fmt='abacus/'+self.get_mode(idx)) for idx in range(len(self.raw_datas))]
 
@@ -134,6 +152,9 @@ class AbacusParser(Parser):
                 kpts = np.array(kpts)
         elif mode == "md" or mode == "relax":
             raise NotImplementedError("output eigenvalues from MD trajectory is not supported by ABACUS.")
+        
+        elif mode == "get_S":
+            raise NotImplementedError("get_S mode does not output eigenvalues or k-point bands.")
         
         else:
             raise NotImplementedError("mode {} is not supported.".format(mode))
@@ -254,7 +275,16 @@ class AbacusParser(Parser):
                 else:
                     raise ValueError(f'{line} is not supported')
 
-        if mode in ["scf", "nscf"]:
+        if mode in ["scf", "nscf", "get_S"]:
+            # get_S only computes and outputs the overlap matrix SR.csr, which uses the
+            # exact same sparse-CSR block layout as the scf data-SR-sparse_SPIN0.csr, so
+            # parse_matrix can be reused directly. H and DM are not available in get_S.
+            if mode == "get_S" and (hamiltonian or density_matrix):
+                raise NotImplementedError(
+                    "get_S mode only outputs the overlap matrix (SR.csr); "
+                    "Hamiltonian and density matrix are not available."
+                )
+
             if hamiltonian:
                 hamiltonian_dict, tmp = self.parse_matrix(
                     matrix_path=os.path.join(output_dir, "data-HR-sparse_SPIN0.csr"), 
@@ -270,7 +300,7 @@ class AbacusParser(Parser):
             
             if overlap:
                 overlap_dict, tmp = self.parse_matrix(
-                    matrix_path=os.path.join(output_dir, "data-SR-sparse_SPIN0.csr"), 
+                    matrix_path=os.path.join(output_dir, "SR.csr" if mode == "get_S" else "data-SR-sparse_SPIN0.csr"), 
                     nsites=nsites,
                     site_norbits=site_norbits,
                     orbital_types_dict=orbital_types_dict,
