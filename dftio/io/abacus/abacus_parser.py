@@ -463,34 +463,54 @@ class AbacusParser(Parser):
                     line4 = f.readline().split()
                     if not spinful:
                         hamiltonian_cur = csr_matrix((np.array(line2).astype(np.float32), np.array(line3).astype(int),
-                                                        np.array(line4).astype(np.int32)), shape=(norbits, norbits), dtype=np.float32).toarray()
+                                                        np.array(line4).astype(np.int32)), shape=(norbits, norbits), dtype=np.float32)
                     else:
                         line2 = np.char.replace(line2, '(', '')
                         line2 = np.char.replace(line2, ')', 'j')
                         line2 = np.char.replace(line2, ',', '+')
                         line2 = np.char.replace(line2, '+-', '-')
                         hamiltonian_cur = csr_matrix((np.array(line2).astype(np.complex64), np.array(line3).astype(int),
-                                                    np.array(line4).astype(np.int32)), shape=(norbits, norbits), dtype=np.complex64).toarray()
-                    for index_site_i in range(nsites):
-                        for index_site_j in range(nsites):
-                            key_str = f"{index_site_i}_{index_site_j}_{R_cur[0]}_{R_cur[1]}_{R_cur[2]}"
-                            mat = hamiltonian_cur[(site_norbits_cumsum[index_site_i]
-                                                    - site_norbits[index_site_i]) * (1 + spinful):
-                                                    site_norbits_cumsum[index_site_i] * (1 + spinful),
-                                    (site_norbits_cumsum[index_site_j] - site_norbits[index_site_j]) * (1 + spinful):
-                                    site_norbits_cumsum[index_site_j] * (1 + spinful)]
-                            if abs(mat).max() < 1e-10:
-                                continue
-                            if not spinful:
-                                mat = self.transform(mat, orbital_types_dict[element[index_site_i]],
-                                                            orbital_types_dict[element[index_site_j]])
-                            else:
-                                mat = mat.reshape((site_norbits[index_site_i], 2, site_norbits[index_site_j], 2))
-                                mat = mat.transpose((1, 0, 3, 2)).reshape((2 * site_norbits[index_site_i],
-                                                                        2 * site_norbits[index_site_j]))
-                                mat = self.transform(mat, orbital_types_dict[element[index_site_i]] * 2,
-                                                        orbital_types_dict[element[index_site_j]] * 2)
-                            matrix_dict[key_str] = mat * factor
+                                                    np.array(line4).astype(np.int32)), shape=(norbits, norbits), dtype=np.complex64)
+                    # Only the (site_i, site_j) blocks that carry a stored entry can
+                    # contribute, so group the COO entries by block instead of looping
+                    # over all nsites**2 pairs.  Everything is done off coo.row/col/data:
+                    # slicing a csr_matrix with two ranges would internally transpose the
+                    # whole matrix per block, and materialising it densely needs
+                    # 12 GiB for a 4400-atom cell.
+                    coo = hamiltonian_cur.tocoo()
+                    nspin = 1 + spinful
+                    site_of_row = np.searchsorted(site_norbits_cumsum,
+                                                  coo.row // nspin, side='right')
+                    site_of_col = np.searchsorted(site_norbits_cumsum,
+                                                  coo.col // nspin, side='right')
+                    block_id = site_of_row * nsites + site_of_col
+                    order = np.argsort(block_id, kind='stable')
+                    block_id = block_id[order]
+                    row_s, col_s, data_s = coo.row[order], coo.col[order], coo.data[order]
+                    starts = np.flatnonzero(np.r_[True, block_id[1:] != block_id[:-1]])
+                    starts = np.r_[starts, block_id.size]
+                    site_offset = site_norbits_cumsum - site_norbits
+                    for g in range(len(starts) - 1):
+                        g0, g1 = int(starts[g]), int(starts[g + 1])
+                        index_site_i, index_site_j = divmod(int(block_id[g0]), nsites)
+                        key_str = f"{index_site_i}_{index_site_j}_{R_cur[0]}_{R_cur[1]}_{R_cur[2]}"
+                        mat = np.zeros((site_norbits[index_site_i] * nspin,
+                                        site_norbits[index_site_j] * nspin),
+                                       dtype=hamiltonian_cur.dtype)
+                        mat[row_s[g0:g1] - site_offset[index_site_i] * nspin,
+                            col_s[g0:g1] - site_offset[index_site_j] * nspin] = data_s[g0:g1]
+                        if abs(mat).max() < 1e-10:
+                            continue
+                        if not spinful:
+                            mat = self.transform(mat, orbital_types_dict[element[index_site_i]],
+                                                        orbital_types_dict[element[index_site_j]])
+                        else:
+                            mat = mat.reshape((site_norbits[index_site_i], 2, site_norbits[index_site_j], 2))
+                            mat = mat.transpose((1, 0, 3, 2)).reshape((2 * site_norbits[index_site_i],
+                                                                    2 * site_norbits[index_site_j]))
+                            mat = self.transform(mat, orbital_types_dict[element[index_site_i]] * 2,
+                                                    orbital_types_dict[element[index_site_j]] * 2)
+                        matrix_dict[key_str] = mat * factor
         return matrix_dict, norbits
     
     def transform(self, mat, l_lefts, l_rights):
